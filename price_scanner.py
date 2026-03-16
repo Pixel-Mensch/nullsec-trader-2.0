@@ -280,6 +280,7 @@ def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) 
                 best_sell[tid] = o["price"]
     print(f"\r  Jita-Orders: {len(all_orders):,} Orders → "
           f"{len(best_sell):,} Items in Jita 4-4  ({time.time()-t0:.1f}s)  ")
+    return best_sell
 
 def bulk_history(type_ids: set, region_id: int, workers: int,
                  label: str, hist_cache: dict) -> dict:
