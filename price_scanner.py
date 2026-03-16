@@ -284,16 +284,18 @@ def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) 
 
 def bulk_history(type_ids: set, region_id: int, workers: int,
                  label: str, hist_cache: dict) -> dict:
-    """Lädt 30-Tage-Historien. Gecachte Einträge (< 23h) werden übersprungen."""
-    now    = time.time()
-    result = {}
+    """Lädt 30-Tage-Historien. Gecachte Einträge (< 23h) werden übersprungen.
+    Gibt {tid: (avg_vol, ratio, avg_price, avg_orders)} zurück."""
+    now      = time.time()
+    result   = {}
     to_fetch = []
 
     for tid in type_ids:
-        key = _hist_key(region_id, tid)
+        key   = _hist_key(region_id, tid)
         entry = hist_cache.get(key)
         if entry and now - entry["ts"] < HIST_CACHE_TTL:
-            result[tid] = (entry["avg"], entry["ratio"])
+            result[tid] = (entry["avg"], entry["ratio"],
+                           entry.get("avg_price", 0.0), entry.get("avg_orders", 0.0))
         else:
             to_fetch.append(tid)
 
@@ -313,24 +315,31 @@ def bulk_history(type_ids: set, region_id: int, workers: int,
             hist = _esi_pages(f"/markets/{region_id}/history/",
                               params={"type_id": tid})
             if not hist:
-                return tid, 0.0, 0.0
-            recent = sorted(hist, key=lambda x: x["date"], reverse=True)[:30]
-            active = [d for d in recent if d["volume"] > 0]
-            avg    = sum(d["volume"] for d in active) / len(recent) if recent else 0.0
-            ratio  = len(active) / len(recent) if recent else 0.0
-            return tid, avg, ratio
+                return tid, 0.0, 0.0, 0.0, 0.0
+            recent     = sorted(hist, key=lambda x: x["date"], reverse=True)[:30]
+            active     = [d for d in recent if d["volume"] > 0]
+            avg_vol    = sum(d["volume"] for d in active) / len(recent) if recent else 0.0
+            ratio      = len(active) / len(recent) if recent else 0.0
+            # Gewichteter Durchschnittspreis (nach Volumen)
+            total_vol  = sum(d["volume"] for d in active)
+            avg_price  = (sum(d["average"] * d["volume"] for d in active) / total_vol
+                          if total_vol > 0 else 0.0)
+            avg_orders = sum(d["order_count"] for d in recent) / len(recent) if recent else 0.0
+            return tid, avg_vol, ratio, avg_price, avg_orders
         except Exception:
-            return tid, 0.0, 0.0
+            return tid, 0.0, 0.0, 0.0, 0.0
         finally:
             with lock:
                 counter[0] += 1
                 _progress(label, counter[0], len(to_fetch), t0)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for tid, avg, ratio in ex.map(fetch, to_fetch):
-            result[tid] = (avg, ratio)
+        for tid, avg_vol, ratio, avg_price, avg_orders in ex.map(fetch, to_fetch):
+            result[tid] = (avg_vol, ratio, avg_price, avg_orders)
             key = _hist_key(region_id, tid)
-            hist_cache[key] = {"avg": avg, "ratio": ratio, "ts": now}
+            hist_cache[key] = {"avg": avg_vol, "ratio": ratio,
+                               "avg_price": avg_price, "avg_orders": avg_orders,
+                               "ts": now}
 
     print(f"\n  {label} fertig  ({time.time()-t0:.1f}s)", flush=True)
     return result
@@ -439,11 +448,11 @@ def scan_all(access_token: str, cfg: dict,
 
         deals = []
         for tid in type_ids:
-            jita_price        = jita_prices[tid]
-            info              = item_infos[tid]
-            volume_m3         = info["volume"]
-            jita_vol          = jita_hist.get(tid, (0.0, 0.0))[0]
-            null_vol, n_ratio = null_hist.get(tid, (0.0, 0.0))
+            jita_price                       = jita_prices[tid]
+            info                             = item_infos[tid]
+            volume_m3                        = info["volume"]
+            jita_vol                         = jita_hist.get(tid, (0,0,0,0))[0]
+            null_vol, n_ratio, avg_p, avg_ord = null_hist.get(tid, (0.0, 0.0, 0.0, 0.0))
 
             if jita_vol < flt["min_daily_vol_jita"]:
                 continue
@@ -451,16 +460,19 @@ def scan_all(access_token: str, cfg: dict,
                 continue
 
             base = {
-                "type_id":    tid,
-                "item_name":  info["name"],
-                "structure":  struct_name,
-                "lane":       s["lane"],
-                "volume_m3":  volume_m3,
-                "jita_vol":   jita_vol,
-                "null_vol":   null_vol,
-                "null_ratio": n_ratio,
+                "type_id":       tid,
+                "item_name":     info["name"],
+                "structure":     struct_name,
+                "lane":          s["lane"],
+                "volume_m3":     volume_m3,
+                "jita_vol":      jita_vol,
+                "null_vol":      null_vol,
+                "null_ratio":    n_ratio,
+                "avg_null_price": avg_p,
+                "avg_orders":    avg_ord,
             }
 
+            # INSTANT: sofort an höchsten Käufer
             if tid in best_buy:
                 r = calc_net_profit(jita_price, best_buy[tid], volume_m3, s,
                                     sales_tax, broker_sell)
@@ -468,12 +480,26 @@ def scan_all(access_token: str, cfg: dict,
                    r["profit_pct"] >= flt["min_profit_pct"]:
                     deals.append({**base, "exit": "instant", **r})
 
-            if tid in best_sell:
+            # PLANNED: Preis gegen historischen Schnitt validieren
+            if tid in best_sell and avg_p > 0:
+                max_list = avg_p * flt.get("max_price_vs_avg", 1.5)
+                if best_sell[tid] > max_list:
+                    continue  # Listing weit über Schnitt → vermutlich Manipulation
+                target = min(best_sell[tid] * 0.999, avg_p * 1.05)
+                r = calc_net_profit(jita_price, target, volume_m3, s,
+                                    sales_tax, broker_sell)
+                if r["profit_isk"] >= flt["min_profit_isk"] and \
+                   r["profit_pct"] >= flt["min_profit_pct"]:
+                    r["price_vs_avg"] = target / avg_p
+                    deals.append({**base, "exit": "planned", **r})
+            elif tid in best_sell and avg_p == 0:
+                # Keine Preishistorie → konservativ: deal zulassen aber ohne Preis-Cap
                 target = best_sell[tid] * 0.999
                 r = calc_net_profit(jita_price, target, volume_m3, s,
                                     sales_tax, broker_sell)
                 if r["profit_isk"] >= flt["min_profit_isk"] and \
                    r["profit_pct"] >= flt["min_profit_pct"]:
+                    r["price_vs_avg"] = None
                     deals.append({**base, "exit": "planned", **r})
 
         print(f"  → {len(deals)} Deals  ({time.time()-t0:.1f}s)")
@@ -498,7 +524,7 @@ def parse_budget(s: str) -> int:
         return int(float(s[:-1]) * 1_000)
     return int(s)
 
-def _plan_units(deal: dict, remaining: float, s: dict) -> int:
+def _plan_units(deal: dict, remaining: float, s: dict, max_days: int = 45) -> int:
     """Berechnet wie viele Einheiten sinnvoll sind (Budget, Volumen, Markttiefe)."""
     jita_per = deal["jita_buy"]
     vol_per  = deal["volume_m3"]
@@ -506,8 +532,9 @@ def _plan_units(deal: dict, remaining: float, s: dict) -> int:
         return 0
     by_budget = int(remaining / jita_per)
     by_m3     = int(s["max_m3"] / vol_per)
-    by_jita   = max(1, int(deal["jita_vol"] * 5))   # max 5 Tage Jita-Volumen
-    by_null   = max(1, int(deal["null_vol"] * 30)) if deal["null_vol"] > 0 else by_jita
+    by_jita   = max(1, int(deal["jita_vol"] * 5))
+    # Null-Volumen: max so viele Einheiten wie sich in max_days verkaufen
+    by_null   = max(1, int(deal["null_vol"] * max_days)) if deal["null_vol"] > 0 else by_jita
     return max(0, min(by_budget, by_m3, by_jita, by_null))
 
 def _calc_batch(deal: dict, units: int, s: dict,
@@ -535,7 +562,8 @@ def _calc_batch(deal: dict, units: int, s: dict,
     }
 
 def plan_structure(deals: list, budget: float, s: dict,
-                   sales_tax: float, broker_sell: float) -> list:
+                   sales_tax: float, broker_sell: float,
+                   max_days: int = 45) -> list:
     """Greedy-Allokation: beste ROI-Deals zuerst, bis Budget aufgebraucht."""
     remaining = budget
     plan      = []
@@ -559,7 +587,7 @@ def plan_structure(deals: list, budget: float, s: dict,
     for d in sorted_deals:
         if remaining < d["jita_buy"]:
             continue
-        units = _plan_units(d, remaining, s)
+        units = _plan_units(d, remaining, s, max_days)
         if units <= 0:
             continue
         batch = _calc_batch(d, units, s, sales_tax, broker_sell)
@@ -620,6 +648,12 @@ def print_results(deals: list):
         print(f"    Gewinn/Stk:   {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
         print(f"    Jita Vol:     ~{d['jita_vol']:>7,.0f}/Tag   "
               f"Null: ~{d['null_vol']:>5.1f}/Tag  ({_activity(d['null_ratio'])})")
+        if d["exit"] == "planned" and d.get("avg_null_price", 0) > 0:
+            pva = d.get("price_vs_avg")
+            ref = d["avg_null_price"]
+            flag = "✓" if pva and pva <= 1.2 else ("⚠" if pva and pva <= 1.5 else "?")
+            print(f"    Referenzpreis:{ref:>15,.0f} ISK  "
+                  f"Listing = {(pva or 0)*100:.0f}% vom Schnitt  {flag}")
 
     print(f"\n{'='*74}")
     print("  ZUSAMMENFASSUNG PRO STRUKTUR")
@@ -673,16 +707,17 @@ def print_and_save_plan(plans: dict, budget: int, cfg: dict, path: str):
 
         NI, NS = 30, 6
         w(f"  {'Item':<{NI}}  {'Menge':>{NS}}  {'Jita/Stk':>12}  "
-          f"{'Invest':>14}  {'Null/Stk':>12}  {'Gewinn':>12}  {'%':>5}")
-        w(f"  {'─'*NI}  {'─'*NS}  {'─'*12}  {'─'*14}  {'─'*12}  {'─'*12}  {'─'*5}")
+          f"{'Invest':>14}  {'Null/Stk':>12}  {'Gewinn':>12}  {'%':>5}  {'~Tage':>5}")
+        w(f"  {'─'*NI}  {'─'*NS}  {'─'*12}  {'─'*14}  {'─'*12}  {'─'*12}  {'─'*5}  {'─'*5}")
 
         for p in sorted(plan, key=lambda x: x["batch"]["profit"], reverse=True):
-            b   = p["batch"]
-            tag = "I" if p["exit"] == "instant" else "P"
+            b        = p["batch"]
+            tag      = "I" if p["exit"] == "instant" else "P"
+            days_est = (b["units"] / p["null_vol"]) if p["null_vol"] > 0 else 0
             w(f"  {p['item_name'][:NI]:<{NI}}  {b['units']:>{NS},}  "
               f"{p['jita_buy']:>12,.0f}  {b['jita_total']:>14,.0f}  "
               f"{p['null_sell']:>12,.0f}  {b['profit']:>12,.0f}  "
-              f"{b['profit_pct']:>4.1f}%  [{tag}]")
+              f"{b['profit_pct']:>4.1f}%  {days_est:>4.0f}d  [{tag}]")
 
         total_invest += invest
         total_profit += profit
@@ -761,8 +796,9 @@ def main():
         plans = {}
         for struct_name, s in cfg["structures"].items():
             struct_deals = by_struct.get(struct_name, [])
+            max_days = cfg["filters"].get("max_days_to_sell", 45)
             plans[struct_name] = plan_structure(
-                struct_deals, budget, s, sales_tax, broker_sell)
+                struct_deals, budget, s, sales_tax, broker_sell, max_days)
 
         txt_path = f"trade_plan_{ts}.txt"
         print(f"\n{'='*74}")
