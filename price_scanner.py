@@ -1,24 +1,18 @@
 """
-EVE Online Nullsec Price Scanner  (Performance Edition)
-========================================================
-Vergleicht Jita-Preise mit konfigurierten Nullsec-Strukturen.
-
-Performance-Ansatz:
-  - Jita + Nullsec-Region werden KOMPLETT in einem Rutsch geladen (Bulk-Fetch)
-  - Item-Infos werden dauerhaft auf Disk gecacht (ändern sich nie)
-  - Nullsec-Regionshistorien laufen PARALLEL via ThreadPoolExecutor
-  - Kein per-Item ESI-Call mehr → von ~3 Minuten auf <30 Sekunden
+EVE Nullsec Price Scanner
+=========================
+Vergleicht Jita-Preise mit Nullsec-Strukturmärkten.
+Zeigt profitable Import-Deals nach allen Kosten (Shipping, Broker Fee, Sales Tax).
 
 Voraussetzungen:
   pip install requests
 
 Setup:
-  1. EVE Developer App: https://developers.eveonline.com/
-     - Callback URL: http://localhost:12345/callback
-     - Scope: esi-markets.structure_markets.v1
-  2. CLIENT_ID unten eintragen
-  3. Struktur-IDs eintragen
-  4. python price_scanner.py
+  1. EVE Developer App anlegen: https://developers.eveonline.com/
+     Callback URL: http://localhost:12345/callback
+     Scope:        esi-markets.structure_markets.v1
+  2. .env anlegen:  EVE_CLIENT_ID=deine_client_id
+  3. python price_scanner.py
 """
 
 import json
@@ -27,68 +21,80 @@ import threading
 import time
 import webbrowser
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
 # ===========================================================================
-# KONFIGURATION – hier alles anpassen
+# KONFIGURATION
 # ===========================================================================
 
-CLIENT_ID = "DEINE_CLIENT_ID_HIER"  # Von https://developers.eveonline.com/
+CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")  # .env: EVE_CLIENT_ID=...
 
-# Struktur-IDs deiner Nullsec-Märkte
+# Strukturen mit Shipping-Raten (Jita → Null)
+# per_m3:     ISK pro m³
+# collateral: Anteil des Jita-Preises als Collateral (0.0 = kein Collateral)
+# min_cost:   Mindestlieferkosten
+# max_m3:     Max. Volumen pro Contract
+# region:     ESI-Region-ID (fest eingetragen, spart API-Calls)
 STRUCTURES = {
-    "O4T (HWL Ziel)":  1234567890123,  # <-- echte ID eintragen
-    "UALX-3":          1234567890124,
-    "C-J6 (ITL Ziel)": 1234567890125,
-    "R-A":             1234567890126,
+    "O4T": {
+        "id":         1040804972352,
+        "region":     10000059,
+        "per_m3":     1250,
+        "collateral": 0.01,
+        "min_cost":   5_000_000,
+        "max_m3":     350_000,
+        "lane":       "HWL",
+    },
+    "R-ARKN": {
+        "id":         1048663825563,
+        "region":     10000039,
+        "per_m3":     1250,
+        "collateral": 0.01,
+        "min_cost":   5_000_000,
+        "max_m3":     350_000,
+        "lane":       "HWL",
+    },
+    "UALX-3": {
+        "id":         1046664001931,
+        "region":     10000061,
+        "per_m3":     1100,
+        "collateral": 0.0,
+        "min_cost":   5_000_000,
+        "max_m3":     350_000,
+        "lane":       "ITL",
+    },
+    "1st Taj Mahgoon": {
+        "id":         1049588174021,
+        "region":     10000009,
+        "per_m3":     1200,
+        "collateral": 0.0,
+        "min_cost":   5_000_000,
+        "max_m3":     350_000,
+        "lane":       "ITL",
+    },
 }
 
-# Jita 4-4 NPC Station ID + Region
+# Jita 4-4
 JITA_STATION_ID     = 60003760
 THE_FORGE_REGION_ID = 10000002
 
-# Shipping-Kosten
-SHIPPING = {
-    "HWL": {
-        "isk_per_m3":     500,        # ISK pro m³ – anpassen!
-        "collateral_pct": 0.006,      # 0.6% Collateral – anpassen!
-        "min_cost":       5_000_000,  # Mindestpreis pro Lieferung
-        "max_m3":         860_000,
-    },
-    "ITL": {
-        "isk_per_m3":     500,
-        "collateral_pct": 0.006,
-        "min_cost":       5_000_000,
-        "max_m3":         860_000,
-    },
-}
-
-STRUCTURE_SHIPPING = {
-    "O4T (HWL Ziel)":  "HWL",
-    "UALX-3":          "HWL",
-    "C-J6 (ITL Ziel)": "ITL",
-    "R-A":             "ITL",
-}
-
-# Skill-Levels
-SKILLS = {
-    "accounting":                3,
-    "broker_relations":          3,
-    "advanced_broker_relations": 0,
-}
+# Gebühren (Accounting 3, Broker Relations 3, Advanced Broker Relations 3)
+# Wir kaufen gegen Jita-Sell-Orders (Instant Buy) → kein Broker Fee auf der Kaufseite
+SALES_TAX   = 0.075 - 0.005 * 3   # 6.0%  (0.5% Rabatt pro Accounting-Level)
+BROKER_SELL = 0.030 + 0.005        # 3.5%  (3% Broker Fee + 0.5% SCC-Surcharge, kein Skill-Rabatt auf Upwell)
 
 # Filter
-MIN_PROFIT_ISK     = 1_000_000
-MIN_PROFIT_PCT     = 10.0
-MIN_DAILY_VOL_JITA = 5
-MIN_DAILY_VOL_NULL = 1
+MIN_PROFIT_ISK     = 1_000_000   # Mindestgewinn absolut
+MIN_PROFIT_PCT     = 10.0        # Mindestgewinn prozentual
+MIN_DAILY_VOL_JITA = 5           # Mindest-Tagesvolumen in Jita
+MIN_DAILY_VOL_NULL = 1           # Mindest-Tagesvolumen in der Nullsec-Region
 
 # Performance
-PARALLEL_WORKERS = 10   # Parallele Threads für History-Calls
+PARALLEL_WORKERS = 10
 ITEM_CACHE_FILE  = "cache/item_info.json"
 TOKEN_CACHE_FILE = "cache/sso_token.json"
 
@@ -96,35 +102,20 @@ TOKEN_CACHE_FILE = "cache/sso_token.json"
 # GEBÜHRENBERECHNUNG
 # ===========================================================================
 
-def calc_sales_tax(price: float) -> float:
-    rate = max(0.08 - 0.004 * SKILLS["accounting"], 0.01)
-    return price * rate
-
-def calc_broker_fee_buy(price: float) -> float:
-    rate = max(0.03 - 0.001 * SKILLS["broker_relations"]
-               - 0.0003 * SKILLS["advanced_broker_relations"], 0.001)
-    return price * rate
-
-def calc_broker_fee_sell(price: float) -> float:
-    return price * 0.05  # Nullsec-Struktur, konservativ 5%
-
-def calc_shipping(jita_price: float, volume_m3: float, service: str) -> float:
-    s = SHIPPING[service]
-    raw = s["isk_per_m3"] * volume_m3 + s["collateral_pct"] * jita_price
+def calc_shipping(jita_price: float, volume_m3: float, s: dict) -> float:
+    raw = s["per_m3"] * volume_m3 + s["collateral"] * jita_price
     return max(raw, s["min_cost"])
 
 def calc_net_profit(jita_price: float, null_price: float,
-                    volume_m3: float, service: str) -> dict:
-    broker_buy  = calc_broker_fee_buy(jita_price)
-    shipping    = calc_shipping(jita_price, volume_m3, service)
-    broker_sell = calc_broker_fee_sell(null_price)
-    sales_tax   = calc_sales_tax(null_price)
-    total_cost  = jita_price + broker_buy + shipping + broker_sell + sales_tax
+                    volume_m3: float, s: dict) -> dict:
+    shipping    = calc_shipping(jita_price, volume_m3, s)
+    broker_sell = null_price * BROKER_SELL
+    sales_tax   = null_price * SALES_TAX
+    total_cost  = jita_price + shipping + broker_sell + sales_tax
     profit_isk  = null_price - total_cost
     profit_pct  = (profit_isk / total_cost * 100) if total_cost > 0 else 0
     return {
         "jita_buy":    jita_price,
-        "broker_buy":  broker_buy,
         "shipping":    shipping,
         "broker_sell": broker_sell,
         "sales_tax":   sales_tax,
@@ -226,7 +217,7 @@ def _save_token(tok):
         json.dump(tok, f, indent=2)
 
 # ===========================================================================
-# ESI – Hilfsfunktionen
+# ESI – HILFSFUNKTIONEN
 # ===========================================================================
 
 ESI = "https://esi.evetech.net/latest"
@@ -242,8 +233,7 @@ def _esi_pages(path: str, token: str = None, params: dict = None) -> list:
     page = 1
     while True:
         params["page"] = page
-        r = requests.get(f"{ESI}{path}", headers=headers,
-                         params=params, timeout=30)
+        r = requests.get(f"{ESI}{path}", headers=headers, params=params, timeout=30)
         if r.status_code == 403:
             print(f"  [WARN] Kein Zugriff: {path}")
             return []
@@ -264,27 +254,22 @@ def _esi_get(path: str, token: str = None, params: dict = None):
         headers["Authorization"] = f"Bearer {token}"
     params = dict(params or {})
     params.setdefault("datasource", "tranquility")
-    r = requests.get(f"{ESI}{path}", headers=headers,
-                     params=params, timeout=30)
+    r = requests.get(f"{ESI}{path}", headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
 # ===========================================================================
-# BULK FETCHER – Herzstück der Performance
+# BULK FETCHER
 # ===========================================================================
 
 def bulk_jita_orders(type_ids: set) -> dict:
-    """
-    Lädt ALLE Jita-Orders in ~5-10 paginierten Calls.
-    Statt 500 Einzelcalls → ein Bulk-Fetch, dann lokal filtern.
-    Gibt best_sell_price[type_id] zurück.
-    """
-    print(f"  [BULK] Lade alle Jita-Orders...")
+    """Lädt ALLE Forge-Orders in ~5–10 paginierten Calls, filtert auf Jita 4-4 Sell-Orders.
+    Gibt {type_id: best_sell_price} zurück."""
+    print("  [BULK] Lade Jita-Orders...")
     t0 = time.time()
     all_orders = _esi_pages(f"/markets/{THE_FORGE_REGION_ID}/orders/",
                             params={"order_type": "all"})
     print(f"  [BULK] {len(all_orders):,} Orders geladen in {time.time()-t0:.1f}s")
-
     best_sell = {}
     for o in all_orders:
         if o.get("location_id") != JITA_STATION_ID:
@@ -295,13 +280,12 @@ def bulk_jita_orders(type_ids: set) -> dict:
             tid = o["type_id"]
             if tid not in best_sell or o["price"] < best_sell[tid]:
                 best_sell[tid] = o["price"]
-
-    print(f"  [BULK] {len(best_sell):,} relevante Items in Jita 4-4 gefunden")
+    print(f"  [BULK] {len(best_sell):,} Items in Jita 4-4 gefunden")
     return best_sell
 
 def bulk_jita_history(type_ids: set) -> dict:
-    """Jita-Historien für alle Items – parallel."""
-    print(f"  [BULK] Jita-Historien für {len(type_ids)} Items (parallel)...")
+    """30-Tage Durchschnittsvolumen pro Item in Jita (parallel)."""
+    print(f"  [BULK] Jita-Historien für {len(type_ids)} Items...")
     t0 = time.time()
     result = {}
 
@@ -312,8 +296,7 @@ def bulk_jita_history(type_ids: set) -> dict:
             if not hist:
                 return tid, 0.0
             recent = sorted(hist, key=lambda x: x["date"], reverse=True)[:30]
-            avg = sum(d["volume"] for d in recent) / len(recent) if recent else 0.0
-            return tid, avg
+            return tid, sum(d["volume"] for d in recent) / len(recent)
         except Exception:
             return tid, 0.0
 
@@ -325,8 +308,8 @@ def bulk_jita_history(type_ids: set) -> dict:
     return result
 
 def bulk_null_history(type_ids: set, region_id: int) -> dict:
-    """Nullsec-Regionshistorien für alle Items – parallel."""
-    print(f"  [BULK] Nullsec-Historien für {len(type_ids)} Items (parallel)...")
+    """30-Tage Durchschnittsvolumen + Aktivitätsquote pro Item in der Nullsec-Region (parallel)."""
+    print(f"  [BULK] Nullsec-Historien für {len(type_ids)} Items...")
     t0 = time.time()
     result = {}
 
@@ -352,7 +335,7 @@ def bulk_null_history(type_ids: set, region_id: int) -> dict:
     return result
 
 # ===========================================================================
-# ITEM-INFO CACHE (Disk) – einmal laden, für immer gecacht
+# ITEM-CACHE (Disk)
 # ===========================================================================
 
 _item_cache: dict = {}
@@ -362,21 +345,20 @@ def load_item_cache():
     if os.path.exists(ITEM_CACHE_FILE):
         with open(ITEM_CACHE_FILE) as f:
             _item_cache = json.load(f)
-        print(f"  [CACHE] {len(_item_cache):,} Items aus Disk-Cache")
+        print(f"  [CACHE] {len(_item_cache):,} Items geladen")
 
 def fetch_item_infos(type_ids: set) -> dict:
-    """Holt Name + m³ für alle Items. Unbekannte werden parallel nachgeladen."""
+    """Name + Volumen (m³) pro Item. Unbekannte werden parallel nachgeladen und gecacht."""
     missing = {tid for tid in type_ids if str(tid) not in _item_cache}
     if missing:
-        print(f"  [CACHE] {len(missing)} neue Items nachladen (parallel)...")
+        print(f"  [CACHE] {len(missing)} neue Items nachladen...")
 
         def fetch(tid):
             try:
                 info = _esi_get(f"/universe/types/{tid}/")
                 return str(tid), {
                     "name":   info.get("name", f"Type {tid}"),
-                    "volume": info.get("packaged_volume",
-                              info.get("volume", 1.0)),
+                    "volume": info.get("packaged_volume", info.get("volume", 1.0)),
                 }
             except Exception:
                 return str(tid), {"name": f"Type {tid}", "volume": 1.0}
@@ -388,31 +370,10 @@ def fetch_item_infos(type_ids: set) -> dict:
         os.makedirs(os.path.dirname(ITEM_CACHE_FILE), exist_ok=True)
         with open(ITEM_CACHE_FILE, "w") as f:
             json.dump(_item_cache, f)
-        print(f"  [CACHE] Gespeichert ({len(_item_cache):,} Items total)")
+        print(f"  [CACHE] {len(_item_cache):,} Items gespeichert")
 
     return {tid: _item_cache.get(str(tid), {"name": f"Type {tid}", "volume": 1.0})
             for tid in type_ids}
-
-# ===========================================================================
-# REGION AUFLÖSUNG
-# ===========================================================================
-
-_region_cache: dict = {}
-
-def resolve_region(structure_id: int, token: str):
-    if structure_id in _region_cache:
-        return _region_cache[structure_id]
-    try:
-        info   = _esi_get(f"/universe/structures/{structure_id}/", token=token)
-        sys    = _esi_get(f"/universe/systems/{info['solar_system_id']}/")
-        con    = _esi_get(f"/universe/constellations/{sys['constellation_id']}/")
-        region = con["region_id"]
-        _region_cache[structure_id] = region
-        print(f"  [GEO] → Region {region}")
-        return region
-    except Exception as e:
-        print(f"  [WARN] Region-Auflösung fehlgeschlagen: {e}")
-        return None
 
 # ===========================================================================
 # SCANNER
@@ -421,33 +382,23 @@ def resolve_region(structure_id: int, token: str):
 def scan_all(access_token: str) -> list:
     total_start = time.time()
     all_deals   = []
-    fake_ids    = {1234567890123, 1234567890124, 1234567890125, 1234567890126}
 
-    for struct_name, struct_id in STRUCTURES.items():
-        if struct_id in fake_ids:
-            print(f"\n[SKIP] {struct_name} – Platzhalter-ID eintragen")
-            continue
-
-        service = STRUCTURE_SHIPPING.get(struct_name, "HWL")
+    for struct_name, s in STRUCTURES.items():
         print(f"\n{'='*55}")
-        print(f"[SCAN] {struct_name}  (via {service})")
+        print(f"[SCAN] {struct_name}  (via {s['lane']})")
         print(f"{'='*55}")
         t0 = time.time()
 
-        # Region auflösen
-        region_id = resolve_region(struct_id, access_token)
-
         # Struktur-Orders laden
-        print(f"  Lade Struktur-Orders...")
         struct_orders = _esi_pages(
-            f"/markets/structures/{struct_id}/", token=access_token)
+            f"/markets/structures/{s['id']}/", token=access_token)
         if not struct_orders:
-            print(f"  Keine Orders oder kein Zugriff.")
+            print("  Keine Orders oder kein Zugriff.")
             continue
 
         # Beste Kauf- und Verkaufsaufträge pro Item
-        best_buy  = {}  # höchster Kaufpreis (Instant-Sell Ziel)
-        best_sell = {}  # günstigster Verkaufspreis (Planned-Sell Wettbewerb)
+        best_buy  = {}  # höchster Kaufpreis (Instant-Sell-Ziel)
+        best_sell = {}  # günstigster Verkaufspreis (Planned-Sell-Wettbewerb)
         for o in struct_orders:
             tid = o["type_id"]
             if o["is_buy_order"]:
@@ -464,57 +415,53 @@ def scan_all(access_token: str) -> list:
 
         # Jita Bulk-Fetch
         jita_prices = bulk_jita_orders(type_ids)
-        type_ids    = type_ids & set(jita_prices)  # nur was in Jita verfügbar ist
+        type_ids    = type_ids & set(jita_prices)
         if not type_ids:
-            print("  Keine Überschneidung mit Jita-Sortiment.")
+            print("  Kein Overlap mit Jita-Sortiment.")
             continue
 
-        # Item-Infos (gecacht)
+        # Item-Infos (gecacht) + Historien
         item_infos = fetch_item_infos(type_ids)
+        jita_hist  = bulk_jita_history(type_ids)
+        null_hist  = bulk_null_history(type_ids, s["region"])
 
-        # Historien parallel
-        jita_hist = bulk_jita_history(type_ids)
-        null_hist = bulk_null_history(type_ids, region_id) if region_id else {}
-
-        # Deal-Berechnung komplett in RAM
-        print(f"  Berechne Deals...")
+        # Deal-Berechnung
+        print("  Berechne Deals...")
         deals = []
         for tid in type_ids:
-            jita_price       = jita_prices[tid]
-            info             = item_infos[tid]
-            volume_m3        = info["volume"]
-            jita_vol         = jita_hist.get(tid, 0.0)
+            jita_price        = jita_prices[tid]
+            info              = item_infos[tid]
+            volume_m3         = info["volume"]
+            jita_vol          = jita_hist.get(tid, 0.0)
             null_vol, n_ratio = null_hist.get(tid, (0.0, 0.0))
 
             if jita_vol < MIN_DAILY_VOL_JITA:
                 continue
-            if region_id and null_vol < MIN_DAILY_VOL_NULL:
+            if null_vol < MIN_DAILY_VOL_NULL:
                 continue
 
             base = {
-                "type_id":   tid,
-                "item_name": info["name"],
-                "structure": struct_name,
-                "service":   service,
-                "volume_m3": volume_m3,
-                "jita_vol":  jita_vol,
-                "null_vol":  null_vol,
+                "type_id":    tid,
+                "item_name":  info["name"],
+                "structure":  struct_name,
+                "lane":       s["lane"],
+                "volume_m3":  volume_m3,
+                "jita_vol":   jita_vol,
+                "null_vol":   null_vol,
                 "null_ratio": n_ratio,
             }
 
-            # Instant-Sell
+            # Instant-Sell: wir verkaufen direkt an den höchsten Käufer
             if tid in best_buy:
-                r = calc_net_profit(jita_price, best_buy[tid], volume_m3, service)
-                if (r["profit_isk"] >= MIN_PROFIT_ISK
-                        and r["profit_pct"] >= MIN_PROFIT_PCT):
+                r = calc_net_profit(jita_price, best_buy[tid], volume_m3, s)
+                if r["profit_isk"] >= MIN_PROFIT_ISK and r["profit_pct"] >= MIN_PROFIT_PCT:
                     deals.append({**base, "exit": "instant", **r})
 
-            # Planned-Sell (0.1% unter günstigstem Wettbewerber)
+            # Planned-Sell: wir unterbieten den günstigsten Verkäufer um 0.1%
             if tid in best_sell:
                 target = best_sell[tid] * 0.999
-                r = calc_net_profit(jita_price, target, volume_m3, service)
-                if (r["profit_isk"] >= MIN_PROFIT_ISK
-                        and r["profit_pct"] >= MIN_PROFIT_PCT):
+                r = calc_net_profit(jita_price, target, volume_m3, s)
+                if r["profit_isk"] >= MIN_PROFIT_ISK and r["profit_pct"] >= MIN_PROFIT_PCT:
                     deals.append({**base, "exit": "planned", **r})
 
         print(f"  → {len(deals)} profitable Deals  ({time.time()-t0:.1f}s)")
@@ -528,34 +475,30 @@ def scan_all(access_token: str) -> list:
 # ===========================================================================
 
 def _activity(ratio: float) -> str:
-    if ratio >= 0.8: return "🟢 aktiv"
-    if ratio >= 0.4: return "🟡 gelegentlich"
-    if ratio >  0:   return "🔴 selten"
-    return "⚪ keine Daten"
+    if ratio >= 0.8: return "aktiv"
+    if ratio >= 0.4: return "gelegentlich"
+    if ratio >  0:   return "selten"
+    return "keine Daten"
 
 def print_deal(d: dict):
     tag = "[INSTANT]" if d["exit"] == "instant" else "[PLANNED]"
     print(f"\n  {tag} {d['item_name']}")
-    print(f"    Struktur:        {d['structure']}  (via {d['service']})")
-    print(f"    Jita Kauf:       {d['jita_buy']:>15,.0f} ISK")
-    print(f"    Broker Fee:      {d['broker_buy']:>15,.0f} ISK")
-    print(f"    Lieferkosten:    {d['shipping']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³)")
-    print(f"    Null Verkauf:    {d['null_sell']:>15,.0f} ISK")
-    print(f"    Broker + Tax:    {d['broker_sell'] + d['sales_tax']:>15,.0f} ISK")
+    print(f"    Struktur:      {d['structure']}  (via {d['lane']})")
+    print(f"    Jita Kauf:     {d['jita_buy']:>15,.0f} ISK")
+    print(f"    Shipping:      {d['shipping']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³)")
+    print(f"    Null Verkauf:  {d['null_sell']:>15,.0f} ISK")
+    print(f"    Broker + Tax:  {d['broker_sell'] + d['sales_tax']:>15,.0f} ISK")
     print(f"    {'─'*42}")
-    print(f"    Nettogewinn:     {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
-    print(f"    Jita Vol:        ~{d['jita_vol']:>8,.0f} / Tag")
+    print(f"    Nettogewinn:   {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
+    print(f"    Jita Vol:      ~{d['jita_vol']:>8,.0f} / Tag")
     if d["null_vol"] > 0:
-        print(f"    Null Vol:        ~{d['null_vol']:>8,.1f} / Tag  "
-              f"{_activity(d['null_ratio'])}  "
-              f"({d['null_ratio']*100:.0f}% aktiv / 30 Tage)")
-    else:
-        print(f"    Null Vol:        keine Regionsdaten")
+        print(f"    Null Vol:      ~{d['null_vol']:>8,.1f} / Tag  "
+              f"({_activity(d['null_ratio'])}, {d['null_ratio']*100:.0f}% aktiv / 30 Tage)")
 
 def print_results(deals: list):
     if not deals:
         print("\n[RESULT] Keine profitablen Deals gefunden.")
-        print("  Tipp: MIN_PROFIT_ISK / MIN_PROFIT_PCT in der Config reduzieren.")
+        print("  Tipp: MIN_PROFIT_ISK / MIN_PROFIT_PCT reduzieren.")
         return
 
     top = sorted(deals, key=lambda d: d["profit_isk"], reverse=True)
@@ -571,9 +514,9 @@ def print_results(deals: list):
     by_s = defaultdict(list)
     for d in deals:
         by_s[d["structure"]].append(d)
-    for s, ds in by_s.items():
+    for struct, ds in by_s.items():
         best = max(ds, key=lambda x: x["profit_isk"])
-        print(f"  {s}: {len(ds)} Deals | "
+        print(f"  {struct}: {len(ds)} Deals | "
               f"Bester: {best['item_name']} "
               f"+{best['profit_isk']:,.0f} ISK ({best['profit_pct']:.1f}%)")
 
@@ -583,15 +526,15 @@ def print_results(deals: list):
 
 def main():
     print("=" * 55)
-    print("  EVE Nullsec Price Scanner – Performance Edition")
+    print("  EVE Nullsec Price Scanner")
     print("=" * 55)
 
-    if CLIENT_ID == "DEINE_CLIENT_ID_HIER":
-        print("\n[FEHLER] CLIENT_ID fehlt!")
-        print(f"  1. https://developers.eveonline.com/ → neue App anlegen")
-        print(f"  2. Callback URL: http://localhost:{CALLBACK_PORT}/callback")
+    if not CLIENT_ID:
+        print("\n[FEHLER] EVE_CLIENT_ID fehlt!")
+        print("  1. https://developers.eveonline.com/ → neue App anlegen")
+        print(f"  2. Callback URL: {CALLBACK_URL}")
         print(f"  3. Scope: {SCOPE}")
-        print(f"  4. Client ID oben im Script eintragen")
+        print("  4. .env anlegen: EVE_CLIENT_ID=deine_client_id")
         return
 
     os.makedirs("cache", exist_ok=True)
@@ -599,9 +542,8 @@ def main():
 
     print("\n[AUTH] Token prüfen...")
     tok = get_valid_token()
-    print(f"[AUTH] OK  |  "
-          f"Sales Tax: {max(0.08 - 0.004*SKILLS['accounting'], 0.01)*100:.1f}%  |  "
-          f"Broker Fee Jita: {max(0.03 - 0.001*SKILLS['broker_relations'], 0.001)*100:.1f}%")
+    print(f"[AUTH] OK  |  Sales Tax: {SALES_TAX*100:.1f}%  |  "
+          f"Sell Broker+SCC: {BROKER_SELL*100:.1f}%")
 
     deals = scan_all(tok["access_token"])
     print_results(deals)
