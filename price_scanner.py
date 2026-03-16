@@ -235,16 +235,39 @@ def _hist_key(region_id: int, type_id: int) -> str:
 # ===========================================================================
 
 def _progress(label: str, done: int, total: int, t0: float):
-    pct  = done / total * 100
-    eta  = (time.time() - t0) / done * (total - done) if done else 0
-    print(f"\r  {label}: {done}/{total}  ({pct:.0f}%)  ETA {eta:.0f}s   ",
+    pct      = done / total * 100
+    elapsed  = time.time() - t0
+    eta      = elapsed / done * (total - done) if done else 0
+    bar_len  = 20
+    filled   = int(bar_len * done / total)
+    bar      = "█" * filled + "░" * (bar_len - filled)
+    print(f"\r  {label}  [{bar}] {done}/{total} ({pct:.0f}%)  ETA {eta:.0f}s  ",
           end="", flush=True)
 
 def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) -> dict:
-    print("  Lade Jita-Orders...", flush=True)
-    t0 = time.time()
-    all_orders = _esi_pages(f"/markets/{forge_region_id}/orders/",
-                            params={"order_type": "all"})
+    t0      = time.time()
+    headers = {"Accept": "application/json", "datasource": "tranquility"}
+    params  = {"order_type": "all", "datasource": "tranquility"}
+
+    # Erste Seite laden um Gesamtseitenanzahl zu kennen
+    params["page"] = 1
+    r = requests.get(f"{ESI}/markets/{forge_region_id}/orders/",
+                     headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    all_orders   = r.json()
+    total_pages  = int(r.headers.get("X-Pages", 1))
+    print(f"\r  Jita-Orders: Seite 1/{total_pages}  ({len(all_orders):,} Orders)  ",
+          end="", flush=True)
+
+    for page in range(2, total_pages + 1):
+        params["page"] = page
+        r = requests.get(f"{ESI}/markets/{forge_region_id}/orders/",
+                         headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        all_orders.extend(r.json())
+        print(f"\r  Jita-Orders: Seite {page}/{total_pages}  ({len(all_orders):,} Orders)  ",
+              end="", flush=True)
+
     best_sell = {}
     for o in all_orders:
         if o.get("location_id") != jita_station_id:
@@ -255,9 +278,8 @@ def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) 
             tid = o["type_id"]
             if tid not in best_sell or o["price"] < best_sell[tid]:
                 best_sell[tid] = o["price"]
-    print(f"  {len(all_orders):,} Orders → {len(best_sell):,} Items in Jita 4-4  "
-          f"({time.time()-t0:.1f}s)")
-    return best_sell
+    print(f"\r  Jita-Orders: {len(all_orders):,} Orders → "
+          f"{len(best_sell):,} Items in Jita 4-4  ({time.time()-t0:.1f}s)  ")
 
 def bulk_history(type_ids: set, region_id: int, workers: int,
                  label: str, hist_cache: dict) -> dict:
@@ -309,7 +331,7 @@ def bulk_history(type_ids: set, region_id: int, workers: int,
             key = _hist_key(region_id, tid)
             hist_cache[key] = {"avg": avg, "ratio": ratio, "ts": now}
 
-    print(f"\n  {label} fertig  ({time.time()-t0:.1f}s)")
+    print(f"\n  {label} fertig  ({time.time()-t0:.1f}s)", flush=True)
     return result
 
 # ===========================================================================
