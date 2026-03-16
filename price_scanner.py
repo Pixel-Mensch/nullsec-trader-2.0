@@ -484,6 +484,95 @@ def scan_all(access_token: str, cfg: dict,
     return all_deals
 
 # ===========================================================================
+# BUDGET-PLANUNG
+# ===========================================================================
+
+def parse_budget(s: str) -> int:
+    """Parst '500m', '1b', '500000000' → int ISK."""
+    s = s.strip().lower().replace(".", "").replace(",", "").replace("_", "")
+    if s.endswith("b"):
+        return int(float(s[:-1]) * 1_000_000_000)
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1_000)
+    return int(s)
+
+def _plan_units(deal: dict, remaining: float, s: dict) -> int:
+    """Berechnet wie viele Einheiten sinnvoll sind (Budget, Volumen, Markttiefe)."""
+    jita_per = deal["jita_buy"]
+    vol_per  = deal["volume_m3"]
+    if jita_per <= 0 or vol_per <= 0:
+        return 0
+    by_budget = int(remaining / jita_per)
+    by_m3     = int(s["max_m3"] / vol_per)
+    by_jita   = max(1, int(deal["jita_vol"] * 5))   # max 5 Tage Jita-Volumen
+    by_null   = max(1, int(deal["null_vol"] * 30)) if deal["null_vol"] > 0 else by_jita
+    return max(0, min(by_budget, by_m3, by_jita, by_null))
+
+def _calc_batch(deal: dict, units: int, s: dict,
+                sales_tax: float, broker_sell: float) -> dict:
+    """Neu-Berechnung von Shipping + Profit für eine bestimmte Menge."""
+    jita_total = deal["jita_buy"]  * units
+    vol_total  = deal["volume_m3"] * units
+    null_total = deal["null_sell"] * units
+    shipping   = calc_shipping(jita_total, vol_total, s)
+    fee        = null_total * broker_sell
+    tax        = null_total * sales_tax
+    total_cost = jita_total + shipping + fee + tax
+    profit     = null_total - total_cost
+    profit_pct = (profit / total_cost * 100) if total_cost > 0 else 0
+    return {
+        "units":       units,
+        "jita_total":  jita_total,
+        "vol_total":   vol_total,
+        "null_total":  null_total,
+        "shipping":    shipping,
+        "fee_tax":     fee + tax,
+        "total_cost":  total_cost,
+        "profit":      profit,
+        "profit_pct":  profit_pct,
+    }
+
+def plan_structure(deals: list, budget: float, s: dict,
+                   sales_tax: float, broker_sell: float) -> list:
+    """Greedy-Allokation: beste ROI-Deals zuerst, bis Budget aufgebraucht."""
+    remaining = budget
+    plan      = []
+
+    # Bestes Deal pro Item (instant bevorzugt, sonst planned)
+    best_per_item: dict = {}
+    for d in deals:
+        tid = d["type_id"]
+        if tid not in best_per_item:
+            best_per_item[tid] = d
+        else:
+            cur = best_per_item[tid]
+            if d["exit"] == "instant" and cur["exit"] != "instant":
+                best_per_item[tid] = d
+            elif d["profit_pct"] > cur["profit_pct"] and d["exit"] == cur["exit"]:
+                best_per_item[tid] = d
+
+    sorted_deals = sorted(best_per_item.values(),
+                          key=lambda d: d["profit_pct"], reverse=True)
+
+    for d in sorted_deals:
+        if remaining < d["jita_buy"]:
+            continue
+        units = _plan_units(d, remaining, s)
+        if units <= 0:
+            continue
+        batch = _calc_batch(d, units, s, sales_tax, broker_sell)
+        if batch["profit"] <= 0:
+            continue
+        plan.append({**d, "batch": batch})
+        remaining -= batch["jita_total"]
+        if remaining < 1_000_000:
+            break
+
+    return plan
+
+# ===========================================================================
 # AUSGABE
 # ===========================================================================
 
@@ -493,59 +582,121 @@ def _activity(ratio: float) -> str:
     if ratio >  0:   return "selten"
     return "?"
 
-def print_results(deals: list, save_path: str):
+def _isk(n: float) -> str:
+    if abs(n) >= 1_000_000_000: return f"{n/1_000_000_000:.2f}b"
+    if abs(n) >= 1_000_000:     return f"{n/1_000_000:.1f}m"
+    return f"{n:,.0f}"
+
+def print_results(deals: list):
     if not deals:
         print("\n[RESULT] Keine profitablen Deals gefunden.")
         print("  Tipp: min_profit_isk / min_profit_pct in config.json reduzieren.")
         return
 
     top = sorted(deals, key=lambda d: d["profit_isk"], reverse=True)
+    W   = 36
 
-    # Kompakte Tabelle
-    W = 38
-    print(f"\n{'='*75}")
+    print(f"\n{'='*74}")
     print(f"  {'#':<3}  {'Item':<{W}}  {'Struktur':<18}  {'Exit':<7}  "
-          f"{'Gewinn ISK':>12}  {'%':>5}")
-    print(f"  {'─'*3}  {'─'*W}  {'─'*18}  {'─'*7}  {'─'*12}  {'─'*5}")
-
+          f"{'Gewinn':>10}  {'%':>5}")
+    print(f"  {'─'*3}  {'─'*W}  {'─'*18}  {'─'*7}  {'─'*10}  {'─'*5}")
     for i, d in enumerate(top[:30], 1):
-        name = d["item_name"][:W]
-        tag  = "INSTANT" if d["exit"] == "instant" else "PLANNED"
-        print(f"  {i:<3}  {name:<{W}}  {d['structure']:<18}  {tag:<7}  "
-              f"{d['profit_isk']:>12,.0f}  {d['profit_pct']:>4.1f}%")
+        tag = "INSTANT" if d["exit"] == "instant" else "PLANNED"
+        print(f"  {i:<3}  {d['item_name'][:W]:<{W}}  {d['structure']:<18}  "
+              f"{tag:<7}  {_isk(d['profit_isk']):>10}  {d['profit_pct']:>4.1f}%")
 
-    # Detail-Block für Top 5
-    print(f"\n{'='*75}")
+    print(f"\n{'='*74}")
     print("  TOP 5 – DETAIL")
-    print(f"{'='*75}")
+    print(f"{'='*74}")
     for d in top[:5]:
         tag = "INSTANT" if d["exit"] == "instant" else "PLANNED"
         print(f"\n  [{tag}] {d['item_name']}")
-        print(f"  {'─'*50}")
         print(f"    Struktur:     {d['structure']}  (via {d['lane']})")
-        print(f"    Jita Kauf:    {d['jita_buy']:>15,.0f} ISK")
-        print(f"    Shipping:     {d['shipping']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³)")
+        print(f"    Jita Kauf:    {d['jita_buy']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³/Stk)")
         print(f"    Null Verkauf: {d['null_sell']:>15,.0f} ISK")
-        print(f"    Broker+Tax:   {d['fee_sell'] + d['tax']:>15,.0f} ISK")
-        print(f"    {'─'*38}")
-        print(f"    Gewinn:       {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
+        print(f"    Shipping:     {d['shipping']:>15,.0f} ISK")
+        print(f"    Broker+Tax:   {d['fee_sell']+d['tax']:>15,.0f} ISK")
+        print(f"    {'─'*40}")
+        print(f"    Gewinn/Stk:   {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
         print(f"    Jita Vol:     ~{d['jita_vol']:>7,.0f}/Tag   "
               f"Null: ~{d['null_vol']:>5.1f}/Tag  ({_activity(d['null_ratio'])})")
 
-    # Zusammenfassung
-    print(f"\n{'='*75}")
+    print(f"\n{'='*74}")
     print("  ZUSAMMENFASSUNG PRO STRUKTUR")
-    print(f"{'─'*75}")
+    print(f"{'─'*74}")
     by_s = defaultdict(list)
     for d in deals:
         by_s[d["structure"]].append(d)
     for struct, ds in sorted(by_s.items()):
         best = max(ds, key=lambda x: x["profit_isk"])
-        print(f"  {struct:<20}  {len(ds):>3} Deals  |  "
-              f"Bester: {best['item_name'][:30]}  "
-              f"+{best['profit_isk']:,.0f} ISK ({best['profit_pct']:.1f}%)")
+        print(f"  {struct:<22}  {len(ds):>3} Deals  |  "
+              f"Bester: {best['item_name'][:28]}  "
+              f"+{_isk(best['profit_isk'])} ({best['profit_pct']:.1f}%)")
 
-    print(f"\n  Alle {len(deals)} Deals gespeichert: {save_path}")
+def print_and_save_plan(plans: dict, budget: int, cfg: dict, path: str):
+    """Gibt den Budget-Plan aus und speichert ihn als .txt."""
+    ts    = time.strftime("%Y-%m-%d %H:%M")
+    lines = []
+
+    def w(s=""):
+        print(s)
+        lines.append(s)
+
+    w(f"EVE Nullsec Price Scanner – Trade Plan")
+    w(f"Erstellt: {ts}    Budget pro Struktur: {_isk(budget)} ISK")
+    w("=" * 74)
+
+    total_invest  = 0
+    total_profit  = 0
+
+    for struct_name, plan in plans.items():
+        s = cfg["structures"][struct_name]
+        w()
+        w(f"STRUKTUR: {struct_name}  (via {s['lane']})")
+        w("─" * 74)
+
+        if not plan:
+            w("  Keine profitable Allokation möglich.")
+            continue
+
+        invest = sum(p["batch"]["jita_total"] for p in plan)
+        profit = sum(p["batch"]["profit"]     for p in plan)
+        vol    = sum(p["batch"]["vol_total"]  for p in plan)
+        ship   = sum(p["batch"]["shipping"]   for p in plan)
+        pct    = profit / invest * 100 if invest else 0
+
+        w(f"  Budget eingesetzt:  {invest:>15,.0f} ISK  ({invest/budget*100:.0f}% des Budgets)")
+        w(f"  Gesamtshipping:     {ship:>15,.0f} ISK")
+        w(f"  Erwarteter Gewinn:  {profit:>15,.0f} ISK  ({pct:.1f}%)")
+        w(f"  Gesamtvolumen:      {vol:>15,.0f} m³")
+        w()
+
+        NI, NS = 30, 6
+        w(f"  {'Item':<{NI}}  {'Menge':>{NS}}  {'Jita/Stk':>12}  "
+          f"{'Invest':>14}  {'Null/Stk':>12}  {'Gewinn':>12}  {'%':>5}")
+        w(f"  {'─'*NI}  {'─'*NS}  {'─'*12}  {'─'*14}  {'─'*12}  {'─'*12}  {'─'*5}")
+
+        for p in sorted(plan, key=lambda x: x["batch"]["profit"], reverse=True):
+            b   = p["batch"]
+            tag = "I" if p["exit"] == "instant" else "P"
+            w(f"  {p['item_name'][:NI]:<{NI}}  {b['units']:>{NS},}  "
+              f"{p['jita_buy']:>12,.0f}  {b['jita_total']:>14,.0f}  "
+              f"{p['null_sell']:>12,.0f}  {b['profit']:>12,.0f}  "
+              f"{b['profit_pct']:>4.1f}%  [{tag}]")
+
+        total_invest += invest
+        total_profit += profit
+
+    w()
+    w("=" * 74)
+    w(f"  GESAMT")
+    w(f"  Eingesetzt:  {total_invest:>15,.0f} ISK")
+    w(f"  Gewinn:      {total_profit:>15,.0f} ISK  "
+      f"({total_profit/total_invest*100:.1f}%)" if total_invest else "")
+    w(f"  Gespeichert: {path}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 # ===========================================================================
 # MAIN
@@ -567,6 +718,17 @@ def main():
     cfg = load_config()
     sales_tax, broker_sell = make_fee_constants(cfg)
 
+    # Budget abfragen
+    print()
+    raw = input("Budget pro Struktur (z.B. 500m, 1b, 0 = kein Plan): ").strip()
+    budget = 0
+    if raw and raw != "0":
+        try:
+            budget = parse_budget(raw)
+            print(f"  → {budget:,.0f} ISK pro Struktur")
+        except ValueError:
+            print("  Ungültige Eingabe, kein Budget-Plan.")
+
     os.makedirs("cache", exist_ok=True)
     load_item_cache()
 
@@ -577,11 +739,36 @@ def main():
 
     deals = scan_all(tok["access_token"], cfg, sales_tax, broker_sell)
 
-    if deals:
-        out = f"scan_result_{int(time.time())}.json"
-        with open(out, "w") as f:
-            json.dump(deals, f, indent=2)
-        print_results(deals, out)
+    if not deals:
+        return
+
+    ts = int(time.time())
+
+    # JSON speichern
+    json_path = f"scan_result_{ts}.json"
+    with open(json_path, "w") as f:
+        json.dump(deals, f, indent=2)
+
+    # Deals-Übersicht
+    print_results(deals)
+
+    # Budget-Plan
+    if budget > 0:
+        by_struct = defaultdict(list)
+        for d in deals:
+            by_struct[d["structure"]].append(d)
+
+        plans = {}
+        for struct_name, s in cfg["structures"].items():
+            struct_deals = by_struct.get(struct_name, [])
+            plans[struct_name] = plan_structure(
+                struct_deals, budget, s, sales_tax, broker_sell)
+
+        txt_path = f"trade_plan_{ts}.txt"
+        print(f"\n{'='*74}")
+        print(f"  BUDGET-PLAN  ({_isk(budget)} ISK pro Struktur)")
+        print(f"{'='*74}")
+        print_and_save_plan(plans, budget, cfg, txt_path)
 
 if __name__ == "__main__":
     main()
