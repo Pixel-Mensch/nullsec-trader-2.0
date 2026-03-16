@@ -1,0 +1,64 @@
+{
+    "jita": {
+        "station_id": 60003760,
+        "region_id":  10000002
+    },
+
+    "structures": {
+        "O4T": {
+            "id":         1040804972352,
+            "region":     10000059,
+            "lane":       "HWL",
+            "per_m3":     1250,
+            "collateral": 0.01,
+            "min_cost":   5000000,
+            "max_m3":     350000
+        },
+        "R-ARKN": {
+            "id":         1048663825563,
+            "region":     10000039,
+            "lane":       "HWL",
+            "per_m3":     1250,
+            "collateral": 0.01,
+            "min_cost":   5000000,
+            "max_m3":     350000
+        },
+        "UALX-3": {
+            "id":         1046664001931,
+            "region":     10000061,
+            "lane":       "ITL",
+            "per_m3":     1100,
+            "collateral": 0.0,
+            "min_cost":   5000000,
+            "max_m3":     350000
+        },
+        "1st Taj Mahgoon": {
+            "id":         1049588174021,
+            "region":     10000009,
+            "lane":       "ITL",
+            "per_m3":     1200,
+            "collateral": 0.0,
+            "min_cost":   5000000,
+            "max_m3":     350000
+        }
+    },
+
+    "fees": {
+        "sales_tax_base":            0.075,
+        "sales_tax_per_accounting":  0.005,
+        "accounting_level":          3,
+        "sell_broker_fee":           0.030,
+        "scc_surcharge":             0.005
+    },
+
+    "filters": {
+        "min_profit_isk":      1000000,
+        "min_profit_pct":      10.0,
+        "min_daily_vol_jita":  5,
+        "min_daily_vol_null":  1
+    },
+
+    "performance": {
+        "parallel_workers": 10
+    }
+}
