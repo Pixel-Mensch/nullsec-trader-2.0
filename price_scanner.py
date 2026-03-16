@@ -27,6 +27,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()  # lädt .env aus dem Projektordner
 
 # ===========================================================================
 # KONFIGURATION – wird aus config.json geladen
@@ -83,7 +86,7 @@ def calc_net_profit(jita_price: float, null_price: float,
 
 SSO_AUTH_URL  = "https://login.eveonline.com/v2/oauth/authorize"
 SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
-CALLBACK_PORT = 12345
+CALLBACK_PORT = 12563
 CALLBACK_URL  = f"http://localhost:{CALLBACK_PORT}/callback"
 SCOPE         = "esi-markets.structure_markets.v1"
 
