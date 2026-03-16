@@ -705,7 +705,8 @@ def print_and_save_plan(plans: dict, budget: int, cfg: dict, path: str):
         w(f"  Gesamtvolumen:      {vol:>15,.0f} m³")
         w()
 
-        NI, NS = 30, 6
+        NS = 6
+        NI = max(len(p["item_name"]) for p in plan) if plan else 30
         w(f"  {'Item':<{NI}}  {'Menge':>{NS}}  {'Jita/Stk':>12}  "
           f"{'Invest':>14}  {'Null/Stk':>12}  {'Gewinn':>12}  {'%':>5}  {'~Tage':>5}")
         w(f"  {'─'*NI}  {'─'*NS}  {'─'*12}  {'─'*14}  {'─'*12}  {'─'*12}  {'─'*5}  {'─'*5}")
@@ -714,7 +715,7 @@ def print_and_save_plan(plans: dict, budget: int, cfg: dict, path: str):
             b        = p["batch"]
             tag      = "I" if p["exit"] == "instant" else "P"
             days_est = (b["units"] / p["null_vol"]) if p["null_vol"] > 0 else 0
-            w(f"  {p['item_name'][:NI]:<{NI}}  {b['units']:>{NS},}  "
+            w(f"  {p['item_name']:<{NI}}  {b['units']:>{NS},}  "
               f"{p['jita_buy']:>12,.0f}  {b['jita_total']:>14,.0f}  "
               f"{p['null_sell']:>12,.0f}  {b['profit']:>12,.0f}  "
               f"{b['profit_pct']:>4.1f}%  {days_est:>4.0f}d  [{tag}]")
