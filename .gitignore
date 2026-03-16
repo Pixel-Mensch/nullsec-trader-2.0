@@ -1,0 +1,40 @@
+# EVE Nullsec Trader – .gitignore
+
+# OAuth tokens and item cache – NEVER commit these
+cache/
+
+# Scan output files
+scan_result_*.json
+
+# Secrets / environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
