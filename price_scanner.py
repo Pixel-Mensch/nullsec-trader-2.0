@@ -5,11 +5,11 @@ Vergleicht Jita-Preise mit Nullsec-Strukturmärkten und zeigt profitable
 Import-Deals nach allen Kosten (Shipping, Broker Fee, Sales Tax).
 
 Voraussetzungen:
-  pip install requests
+  pip install -r requirements.txt
 
 Setup:
   1. EVE Developer App anlegen: https://developers.eveonline.com/
-     Callback URL: http://localhost:12345/callback
+     Callback URL: http://localhost:12563/callback
      Scope:        esi-markets.structure_markets.v1
   2. .env anlegen:  EVE_CLIENT_ID=deine_client_id
   3. Strukturen + Raten in config.json anpassen
@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()  # lädt .env aus dem Projektordner
+load_dotenv()
 
 # ===========================================================================
 # KONFIGURATION – wird aus config.json geladen
@@ -38,8 +38,10 @@ load_dotenv()  # lädt .env aus dem Projektordner
 CONFIG_FILE      = "config.json"
 ITEM_CACHE_FILE  = "cache/item_info.json"
 TOKEN_CACHE_FILE = "cache/sso_token.json"
+HIST_CACHE_FILE  = "cache/history.json"
+HIST_CACHE_TTL   = 23 * 3600  # Historien-Cache gilt 23 Stunden (EVE aktualisiert täglich)
 
-CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")  # .env: EVE_CLIENT_ID=...
+CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")
 
 def load_config() -> dict:
     with open(CONFIG_FILE) as f:
@@ -50,7 +52,6 @@ def load_config() -> dict:
 # ===========================================================================
 
 def make_fee_constants(cfg: dict) -> tuple[float, float]:
-    """Gibt (sales_tax, broker_sell) zurück, berechnet aus config.json fees."""
     f = cfg["fees"]
     sales_tax   = f["sales_tax_base"] - f["sales_tax_per_accounting"] * f["accounting_level"]
     broker_sell = f["sell_broker_fee"] + f["scc_surcharge"]
@@ -63,12 +64,12 @@ def calc_shipping(jita_price: float, volume_m3: float, s: dict) -> float:
 def calc_net_profit(jita_price: float, null_price: float,
                     volume_m3: float, s: dict,
                     sales_tax: float, broker_sell: float) -> dict:
-    shipping    = calc_shipping(jita_price, volume_m3, s)
-    fee_sell    = null_price * broker_sell
-    tax         = null_price * sales_tax
-    total_cost  = jita_price + shipping + fee_sell + tax
-    profit_isk  = null_price - total_cost
-    profit_pct  = (profit_isk / total_cost * 100) if total_cost > 0 else 0
+    shipping   = calc_shipping(jita_price, volume_m3, s)
+    fee_sell   = null_price * broker_sell
+    tax        = null_price * sales_tax
+    total_cost = jita_price + shipping + fee_sell + tax
+    profit_isk = null_price - total_cost
+    profit_pct = (profit_isk / total_cost * 100) if total_cost > 0 else 0
     return {
         "jita_buy":   jita_price,
         "shipping":   shipping,
@@ -178,7 +179,6 @@ def _save_token(tok):
 ESI = "https://esi.evetech.net/latest"
 
 def _esi_pages(path: str, token: str = None, params: dict = None) -> list:
-    """Lädt alle Seiten eines paginierten ESI-Endpunkts."""
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -189,8 +189,8 @@ def _esi_pages(path: str, token: str = None, params: dict = None) -> list:
     while True:
         params["page"] = page
         r = requests.get(f"{ESI}{path}", headers=headers, params=params, timeout=30)
-        if r.status_code == 403:
-            print(f"  [WARN] Kein Zugriff: {path}")
+        if r.status_code in (401, 403):
+            print(f"  [WARN] Kein Zugriff ({r.status_code}): {path}")
             return []
         r.raise_for_status()
         data = r.json()
@@ -203,7 +203,6 @@ def _esi_pages(path: str, token: str = None, params: dict = None) -> list:
     return results
 
 def _esi_get(path: str, token: str = None, params: dict = None):
-    """Einzelner ESI-Call ohne Paging."""
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -214,17 +213,38 @@ def _esi_get(path: str, token: str = None, params: dict = None):
     return r.json()
 
 # ===========================================================================
+# HISTORIEN-CACHE (Disk, 23h TTL)
+# ===========================================================================
+
+def _load_hist_cache() -> dict:
+    if os.path.exists(HIST_CACHE_FILE):
+        with open(HIST_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+def _save_hist_cache(data: dict):
+    os.makedirs(os.path.dirname(HIST_CACHE_FILE), exist_ok=True)
+    with open(HIST_CACHE_FILE, "w") as f:
+        json.dump(data, f)
+
+def _hist_key(region_id: int, type_id: int) -> str:
+    return f"{region_id}:{type_id}"
+
+# ===========================================================================
 # BULK FETCHER
 # ===========================================================================
 
+def _progress(label: str, done: int, total: int, t0: float):
+    pct  = done / total * 100
+    eta  = (time.time() - t0) / done * (total - done) if done else 0
+    print(f"\r  {label}: {done}/{total}  ({pct:.0f}%)  ETA {eta:.0f}s   ",
+          end="", flush=True)
+
 def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) -> dict:
-    """Lädt alle Forge-Orders in ~5–10 Calls, filtert auf Jita 4-4 Sell-Orders.
-    Gibt {type_id: best_sell_price} zurück."""
-    print("  [BULK] Lade Jita-Orders...")
+    print("  Lade Jita-Orders...", flush=True)
     t0 = time.time()
     all_orders = _esi_pages(f"/markets/{forge_region_id}/orders/",
                             params={"order_type": "all"})
-    print(f"  [BULK] {len(all_orders):,} Orders geladen in {time.time()-t0:.1f}s")
     best_sell = {}
     for o in all_orders:
         if o.get("location_id") != jita_station_id:
@@ -235,38 +255,35 @@ def bulk_jita_orders(type_ids: set, jita_station_id: int, forge_region_id: int) 
             tid = o["type_id"]
             if tid not in best_sell or o["price"] < best_sell[tid]:
                 best_sell[tid] = o["price"]
-    print(f"  [BULK] {len(best_sell):,} Items in Jita 4-4 gefunden")
+    print(f"  {len(all_orders):,} Orders → {len(best_sell):,} Items in Jita 4-4  "
+          f"({time.time()-t0:.1f}s)")
     return best_sell
 
-def bulk_jita_history(type_ids: set, forge_region_id: int, workers: int) -> dict:
-    """30-Tage Durchschnittsvolumen pro Item in Jita (parallel)."""
-    print(f"  [BULK] Jita-Historien für {len(type_ids)} Items...")
-    t0 = time.time()
+def bulk_history(type_ids: set, region_id: int, workers: int,
+                 label: str, hist_cache: dict) -> dict:
+    """Lädt 30-Tage-Historien. Gecachte Einträge (< 23h) werden übersprungen."""
+    now    = time.time()
     result = {}
+    to_fetch = []
 
-    def fetch(tid):
-        try:
-            hist = _esi_pages(f"/markets/{forge_region_id}/history/",
-                              params={"type_id": tid})
-            if not hist:
-                return tid, 0.0
-            recent = sorted(hist, key=lambda x: x["date"], reverse=True)[:30]
-            return tid, sum(d["volume"] for d in recent) / len(recent)
-        except Exception:
-            return tid, 0.0
+    for tid in type_ids:
+        key = _hist_key(region_id, tid)
+        entry = hist_cache.get(key)
+        if entry and now - entry["ts"] < HIST_CACHE_TTL:
+            result[tid] = (entry["avg"], entry["ratio"])
+        else:
+            to_fetch.append(tid)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for tid, vol in ex.map(fetch, type_ids):
-            result[tid] = vol
+    cached_count = len(type_ids) - len(to_fetch)
+    if cached_count:
+        print(f"  {label}: {cached_count}/{len(type_ids)} aus Cache", flush=True)
 
-    print(f"  [BULK] Jita-Historien fertig in {time.time()-t0:.1f}s")
-    return result
+    if not to_fetch:
+        return result
 
-def bulk_null_history(type_ids: set, region_id: int, workers: int) -> dict:
-    """30-Tage Durchschnittsvolumen + Aktivitätsquote pro Item in der Nullsec-Region (parallel)."""
-    print(f"  [BULK] Nullsec-Historien für {len(type_ids)} Items...")
-    t0 = time.time()
-    result = {}
+    t0      = time.time()
+    counter = [0]
+    lock    = threading.Lock()
 
     def fetch(tid):
         try:
@@ -276,21 +293,27 @@ def bulk_null_history(type_ids: set, region_id: int, workers: int) -> dict:
                 return tid, 0.0, 0.0
             recent = sorted(hist, key=lambda x: x["date"], reverse=True)[:30]
             active = [d for d in recent if d["volume"] > 0]
-            avg   = sum(d["volume"] for d in active) / len(recent) if recent else 0.0
-            ratio = len(active) / len(recent) if recent else 0.0
+            avg    = sum(d["volume"] for d in active) / len(recent) if recent else 0.0
+            ratio  = len(active) / len(recent) if recent else 0.0
             return tid, avg, ratio
         except Exception:
             return tid, 0.0, 0.0
+        finally:
+            with lock:
+                counter[0] += 1
+                _progress(label, counter[0], len(to_fetch), t0)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for tid, avg, ratio in ex.map(fetch, type_ids):
+        for tid, avg, ratio in ex.map(fetch, to_fetch):
             result[tid] = (avg, ratio)
+            key = _hist_key(region_id, tid)
+            hist_cache[key] = {"avg": avg, "ratio": ratio, "ts": now}
 
-    print(f"  [BULK] Nullsec-Historien fertig in {time.time()-t0:.1f}s")
+    print(f"\n  {label} fertig  ({time.time()-t0:.1f}s)")
     return result
 
 # ===========================================================================
-# ITEM-CACHE (Disk)
+# ITEM-CACHE (Disk, permanent)
 # ===========================================================================
 
 _item_cache: dict = {}
@@ -300,13 +323,15 @@ def load_item_cache():
     if os.path.exists(ITEM_CACHE_FILE):
         with open(ITEM_CACHE_FILE) as f:
             _item_cache = json.load(f)
-        print(f"  [CACHE] {len(_item_cache):,} Items geladen")
+        print(f"  Item-Cache: {len(_item_cache):,} Items")
 
 def fetch_item_infos(type_ids: set, workers: int) -> dict:
-    """Name + Volumen (m³) pro Item. Unbekannte werden parallel nachgeladen und gecacht."""
     missing = {tid for tid in type_ids if str(tid) not in _item_cache}
     if missing:
-        print(f"  [CACHE] {len(missing)} neue Items nachladen...")
+        print(f"  {len(missing)} neue Items nachladen...", flush=True)
+        t0      = time.time()
+        counter = [0]
+        lock    = threading.Lock()
 
         def fetch(tid):
             try:
@@ -317,15 +342,19 @@ def fetch_item_infos(type_ids: set, workers: int) -> dict:
                 }
             except Exception:
                 return str(tid), {"name": f"Type {tid}", "volume": 1.0}
+            finally:
+                with lock:
+                    counter[0] += 1
+                    _progress("Items", counter[0], len(missing), t0)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for key, val in ex.map(fetch, missing):
                 _item_cache[key] = val
 
+        print()
         os.makedirs(os.path.dirname(ITEM_CACHE_FILE), exist_ok=True)
         with open(ITEM_CACHE_FILE, "w") as f:
             json.dump(_item_cache, f)
-        print(f"  [CACHE] {len(_item_cache):,} Items gespeichert")
 
     return {tid: _item_cache.get(str(tid), {"name": f"Type {tid}", "volume": 1.0})
             for tid in type_ids}
@@ -341,6 +370,7 @@ def scan_all(access_token: str, cfg: dict,
     flt        = cfg["filters"]
     workers    = cfg["performance"]["parallel_workers"]
 
+    hist_cache  = _load_hist_cache()
     total_start = time.time()
     all_deals   = []
 
@@ -379,16 +409,17 @@ def scan_all(access_token: str, cfg: dict,
             continue
 
         item_infos = fetch_item_infos(type_ids, workers)
-        jita_hist  = bulk_jita_history(type_ids, jita["region_id"], workers)
-        null_hist  = bulk_null_history(type_ids, s["region"], workers)
+        jita_hist  = bulk_history(type_ids, jita["region_id"], workers,
+                                  "Jita-Historien", hist_cache)
+        null_hist  = bulk_history(type_ids, s["region"], workers,
+                                  f"Null-Historien ({struct_name})", hist_cache)
 
-        print("  Berechne Deals...")
         deals = []
         for tid in type_ids:
             jita_price        = jita_prices[tid]
             info              = item_infos[tid]
             volume_m3         = info["volume"]
-            jita_vol          = jita_hist.get(tid, 0.0)
+            jita_vol          = jita_hist.get(tid, (0.0, 0.0))[0]
             null_vol, n_ratio = null_hist.get(tid, (0.0, 0.0))
 
             if jita_vol < flt["min_daily_vol_jita"]:
@@ -407,7 +438,6 @@ def scan_all(access_token: str, cfg: dict,
                 "null_ratio": n_ratio,
             }
 
-            # Instant-Sell: direkt an den höchsten Käufer
             if tid in best_buy:
                 r = calc_net_profit(jita_price, best_buy[tid], volume_m3, s,
                                     sales_tax, broker_sell)
@@ -415,7 +445,6 @@ def scan_all(access_token: str, cfg: dict,
                    r["profit_pct"] >= flt["min_profit_pct"]:
                     deals.append({**base, "exit": "instant", **r})
 
-            # Planned-Sell: 0.1% unter dem günstigsten Konkurrenten
             if tid in best_sell:
                 target = best_sell[tid] * 0.999
                 r = calc_net_profit(jita_price, target, volume_m3, s,
@@ -424,9 +453,10 @@ def scan_all(access_token: str, cfg: dict,
                    r["profit_pct"] >= flt["min_profit_pct"]:
                     deals.append({**base, "exit": "planned", **r})
 
-        print(f"  → {len(deals)} profitable Deals  ({time.time()-t0:.1f}s)")
+        print(f"  → {len(deals)} Deals  ({time.time()-t0:.1f}s)")
         all_deals.extend(deals)
 
+    _save_hist_cache(hist_cache)
     print(f"\n[FERTIG] Gesamtzeit: {time.time()-total_start:.1f}s")
     return all_deals
 
@@ -438,47 +468,61 @@ def _activity(ratio: float) -> str:
     if ratio >= 0.8: return "aktiv"
     if ratio >= 0.4: return "gelegentlich"
     if ratio >  0:   return "selten"
-    return "keine Daten"
+    return "?"
 
-def print_deal(d: dict):
-    tag = "[INSTANT]" if d["exit"] == "instant" else "[PLANNED]"
-    print(f"\n  {tag} {d['item_name']}")
-    print(f"    Struktur:      {d['structure']}  (via {d['lane']})")
-    print(f"    Jita Kauf:     {d['jita_buy']:>15,.0f} ISK")
-    print(f"    Shipping:      {d['shipping']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³)")
-    print(f"    Null Verkauf:  {d['null_sell']:>15,.0f} ISK")
-    print(f"    Broker + Tax:  {d['fee_sell'] + d['tax']:>15,.0f} ISK")
-    print(f"    {'─'*42}")
-    print(f"    Nettogewinn:   {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
-    print(f"    Jita Vol:      ~{d['jita_vol']:>8,.0f} / Tag")
-    if d["null_vol"] > 0:
-        print(f"    Null Vol:      ~{d['null_vol']:>8,.1f} / Tag  "
-              f"({_activity(d['null_ratio'])}, {d['null_ratio']*100:.0f}% aktiv / 30 Tage)")
-
-def print_results(deals: list):
+def print_results(deals: list, save_path: str):
     if not deals:
         print("\n[RESULT] Keine profitablen Deals gefunden.")
         print("  Tipp: min_profit_isk / min_profit_pct in config.json reduzieren.")
         return
 
     top = sorted(deals, key=lambda d: d["profit_isk"], reverse=True)
-    print(f"\n{'='*55}")
-    print(f"  TOP DEALS – {len(top)} profitable Möglichkeiten")
-    print(f"{'='*55}")
-    for d in top[:20]:
-        print_deal(d)
 
-    print(f"\n{'='*55}")
+    # Kompakte Tabelle
+    W = 38
+    print(f"\n{'='*75}")
+    print(f"  {'#':<3}  {'Item':<{W}}  {'Struktur':<18}  {'Exit':<7}  "
+          f"{'Gewinn ISK':>12}  {'%':>5}")
+    print(f"  {'─'*3}  {'─'*W}  {'─'*18}  {'─'*7}  {'─'*12}  {'─'*5}")
+
+    for i, d in enumerate(top[:30], 1):
+        name = d["item_name"][:W]
+        tag  = "INSTANT" if d["exit"] == "instant" else "PLANNED"
+        print(f"  {i:<3}  {name:<{W}}  {d['structure']:<18}  {tag:<7}  "
+              f"{d['profit_isk']:>12,.0f}  {d['profit_pct']:>4.1f}%")
+
+    # Detail-Block für Top 5
+    print(f"\n{'='*75}")
+    print("  TOP 5 – DETAIL")
+    print(f"{'='*75}")
+    for d in top[:5]:
+        tag = "INSTANT" if d["exit"] == "instant" else "PLANNED"
+        print(f"\n  [{tag}] {d['item_name']}")
+        print(f"  {'─'*50}")
+        print(f"    Struktur:     {d['structure']}  (via {d['lane']})")
+        print(f"    Jita Kauf:    {d['jita_buy']:>15,.0f} ISK")
+        print(f"    Shipping:     {d['shipping']:>15,.0f} ISK  ({d['volume_m3']:.2f} m³)")
+        print(f"    Null Verkauf: {d['null_sell']:>15,.0f} ISK")
+        print(f"    Broker+Tax:   {d['fee_sell'] + d['tax']:>15,.0f} ISK")
+        print(f"    {'─'*38}")
+        print(f"    Gewinn:       {d['profit_isk']:>15,.0f} ISK  ({d['profit_pct']:.1f}%)")
+        print(f"    Jita Vol:     ~{d['jita_vol']:>7,.0f}/Tag   "
+              f"Null: ~{d['null_vol']:>5.1f}/Tag  ({_activity(d['null_ratio'])})")
+
+    # Zusammenfassung
+    print(f"\n{'='*75}")
     print("  ZUSAMMENFASSUNG PRO STRUKTUR")
-    print(f"{'='*55}")
+    print(f"{'─'*75}")
     by_s = defaultdict(list)
     for d in deals:
         by_s[d["structure"]].append(d)
-    for struct, ds in by_s.items():
+    for struct, ds in sorted(by_s.items()):
         best = max(ds, key=lambda x: x["profit_isk"])
-        print(f"  {struct}: {len(ds)} Deals | "
-              f"Bester: {best['item_name']} "
+        print(f"  {struct:<20}  {len(ds):>3} Deals  |  "
+              f"Bester: {best['item_name'][:30]}  "
               f"+{best['profit_isk']:,.0f} ISK ({best['profit_pct']:.1f}%)")
+
+    print(f"\n  Alle {len(deals)} Deals gespeichert: {save_path}")
 
 # ===========================================================================
 # MAIN
@@ -509,13 +553,12 @@ def main():
           f"Sell Broker+SCC: {broker_sell*100:.1f}%")
 
     deals = scan_all(tok["access_token"], cfg, sales_tax, broker_sell)
-    print_results(deals)
 
     if deals:
         out = f"scan_result_{int(time.time())}.json"
         with open(out, "w") as f:
             json.dump(deals, f, indent=2)
-        print(f"\n[SAVE] {out}")
+        print_results(deals, out)
 
 if __name__ == "__main__":
     main()
